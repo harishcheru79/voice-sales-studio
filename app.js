@@ -7,6 +7,10 @@
   let startedAt = 0;
   let timer = null;
   let recognition = null;
+  let assistantSpeaking = false;
+  let speechPlayer = null;
+  let speechObjectUrl = null;
+  let availableVoices = [];
   let mediaRecorder = null;
   let audioStream = null;
   let audioChunks = [];
@@ -17,7 +21,7 @@
 
   const $ = (id) => document.getElementById(id);
   const elements = {
-    status: $('callStatus'), visual: $('callVisual'), visualCaption: $('visualCaption'), visualSubcaption: $('visualSubcaption'), duration: $('duration'), recording: $('recordingIndicator'), consent: $('consentToggle'), start: $('startCall'), end: $('endCall'), messages: $('messages'), input: $('messageInput'), form: $('messageForm'), send: $('messageForm').querySelector('.send-button'), mic: $('micButton'), summary: $('summaryContent'), outcome: $('statusContent'), navCount: $('navCount'), historyTotal: $('historyTotal'), historyList: $('historyList'), search: $('historySearch'), filter: $('statusFilter'), studio: $('studioView'), history: $('historyView'), breadcrumb: $('breadcrumb')
+    status: $('callStatus'), visual: $('callVisual'), visualCaption: $('visualCaption'), visualSubcaption: $('visualSubcaption'), duration: $('duration'), recording: $('recordingIndicator'), consent: $('consentToggle'), start: $('startCall'), end: $('endCall'), messages: $('messages'), input: $('messageInput'), form: $('messageForm'), send: $('messageForm').querySelector('.send-button'), mic: $('micButton'), voiceSelect: $('voiceSelect'), summary: $('summaryContent'), outcome: $('statusContent'), navCount: $('navCount'), historyTotal: $('historyTotal'), historyList: $('historyList'), search: $('historySearch'), filter: $('statusFilter'), studio: $('studioView'), history: $('historyView'), breadcrumb: $('breadcrumb')
   };
   const openDb = () => new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -59,24 +63,111 @@
     messages.push({ role, text, time: timeLabel(Date.now()) });
     renderMessages();
   }
-  function speak(text) {
+  function rankVoice(voice) {
+    const language = voice.lang.toLowerCase();
+    if (!language.startsWith('en')) return -1;
+    let score = language === 'en-us' ? 50 : 35;
+    if (/natural|neural|enhanced/i.test(voice.name)) score += 35;
+    if (/google us english|samantha|ava|aria|jenny|serena/i.test(voice.name)) score += 25;
+    if (voice.default) score += 5;
+    return score;
+  }
+  function loadVoices() {
     if (!('speechSynthesis' in window)) return;
+    availableVoices = window.speechSynthesis.getVoices().filter(voice => rankVoice(voice) >= 0);
+    const select = elements.voiceSelect;
+    if (!select) return;
+    const previous = select.value;
+    select.innerHTML = '<option value="auto">Auto voice</option>';
+    availableVoices.forEach(voice => {
+      const option = document.createElement('option');
+      option.value = voice.voiceURI;
+      option.textContent = `${voice.name} · ${voice.lang}`;
+      select.appendChild(option);
+    });
+    if (previous && [...select.options].some(option => option.value === previous)) select.value = previous;
+  }
+  function browserVoice() {
+    if (elements.voiceSelect?.value && elements.voiceSelect.value !== 'auto') {
+      return availableVoices.find(voice => voice.voiceURI === elements.voiceSelect.value) || null;
+    }
+    return [...availableVoices].sort((a, b) => rankVoice(b) - rankVoice(a))[0] || null;
+  }
+  function stopListeningForSpeech() {
+    assistantSpeaking = true;
+    if (recognition) { try { recognition.stop(); } catch (_) {} }
+  }
+  function resumeListeningAfterSpeech() {
+    assistantSpeaking = false;
+    if (!active) return;
+    if (recognition) { try { recognition.start(); return; } catch (_) {} }
+    startRecognition();
+  }
+  function speakWithBrowser(text) {
+    if (!active) { assistantSpeaking = false; return; }
+    if (!('speechSynthesis' in window) || !window.SpeechSynthesisUtterance) {
+      resumeListeningAfterSpeech();
+      return;
+    }
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1.02;
+    utterance.rate = 0.9;
     utterance.pitch = 1;
+    utterance.volume = 1;
     utterance.lang = 'en-US';
+    const voice = browserVoice();
+    if (voice) utterance.voice = voice;
+    utterance.onend = resumeListeningAfterSpeech;
+    utterance.onerror = resumeListeningAfterSpeech;
     window.speechSynthesis.speak(utterance);
+  }
+  async function speak(text) {
+    if (!text) return;
+    stopListeningForSpeech();
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    if (!elements.voiceSelect?.value || elements.voiceSelect.value === 'auto') {
+      try {
+        const response = await fetch('/api/speech', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        if (!active) { assistantSpeaking = false; return; }
+        if (response.ok) {
+          const audioBlob = await response.blob();
+          if (!active) { assistantSpeaking = false; return; }
+          if (speechObjectUrl) URL.revokeObjectURL(speechObjectUrl);
+          speechObjectUrl = URL.createObjectURL(audioBlob);
+          speechPlayer = new Audio(speechObjectUrl);
+          speechPlayer.onended = () => {
+            speechPlayer = null;
+            URL.revokeObjectURL(speechObjectUrl);
+            speechObjectUrl = null;
+            resumeListeningAfterSpeech();
+          };
+          speechPlayer.onerror = () => {
+            speechPlayer = null;
+            if (speechObjectUrl) URL.revokeObjectURL(speechObjectUrl);
+            speechObjectUrl = null;
+            speakWithBrowser(text);
+          };
+          await speechPlayer.play();
+          return;
+        }
+      } catch (_) {}
+    }
+    speakWithBrowser(text);
   }
   function startRecognition() {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!Recognition || !active) return;
+    if (!Recognition || !active || assistantSpeaking) return;
+    if (recognition) { try { recognition.start(); return; } catch (_) {} }
     recognition = new Recognition();
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = 'en-US';
     let finalText = '';
     recognition.onresult = (event) => {
+      if (assistantSpeaking) return;
       let interim = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const chunk = event.results[i][0].transcript;
@@ -94,7 +185,7 @@
     recognition.onerror = (event) => {
       if (event.error === 'not-allowed') $('browserNote').textContent = 'Microphone access was blocked. Enable it in your browser settings or type a response below.';
     };
-    recognition.onend = () => { if (active && recognition) { try { recognition.start(); } catch (_) {} } };
+    recognition.onend = () => { if (active && !assistantSpeaking && recognition) { try { recognition.start(); } catch (_) {} } };
     try { recognition.start(); } catch (_) {}
   }
   async function startRecording() {
@@ -114,7 +205,7 @@
     }
   }
   function productIntro() {
-    return 'Hi there! Thanks for taking a moment with me. I’m your AI sales assistant. I’d love to learn a little about your workflow and show you how our product can help. What’s the biggest challenge your team is trying to solve right now?';
+    return 'Hi, thanks for taking a moment. I’m your sales assistant. I’d love to learn about your workflow. What is one challenge your team is trying to solve right now?';
   }
   function assistantReply(text) {
     const t = text.toLowerCase();
@@ -204,6 +295,9 @@
     active = false;
     clearInterval(timer);
     timer = null;
+    assistantSpeaking = false;
+    if (speechPlayer) { speechPlayer.pause(); speechPlayer = null; }
+    if (speechObjectUrl) { URL.revokeObjectURL(speechObjectUrl); speechObjectUrl = null; }
     if (recognition) { recognition.onend = null; recognition.stop(); recognition = null; }
     window.speechSynthesis?.cancel();
     const duration = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
@@ -297,6 +391,10 @@
   $('closeDialog').addEventListener('click', () => $('infoDialog').close());
   $('gotIt').addEventListener('click', () => $('infoDialog').close());
   $('helpButton').addEventListener('click', () => $('infoDialog').showModal());
+  if ('speechSynthesis' in window) {
+    loadVoices();
+    window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+  }
   openDb().then(database => { db = database; return renderHistory(); }).catch(() => { $('browserNote').textContent = 'This app needs browser storage enabled to save conversation history.'; });
   if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) $('browserNote').textContent = 'Live voice recognition is not available in this browser. Try Chrome or Edge, or type responses instead.';
 })();
